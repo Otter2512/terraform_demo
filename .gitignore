@@ -1,0 +1,31 @@
+# Thư mục chứa provider/module đã tải về khi chạy terraform init
+**/.terraform/*
+
+# File state và backup: chứa thông tin hạ tầng + secret dạng rõ -> KHÔNG commit
+*.tfstate
+*.tfstate.*
+
+# File plan nhị phân (có thể chứa secret)
+*.tfplan
+tfplan
+
+# Log khi Terraform crash
+crash.log
+crash.*.log
+
+# File biến chứa secret (quy ước đặt tên riêng, không commit)
+*.secret.tfvars
+*.auto.tfvars
+
+# File override cục bộ của từng người
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# File cấu hình CLI cá nhân
+.terraformrc
+terraform.rc
+
+# GIỮ LẠI lock file để cả team/CI dùng đúng version provider
+!.terraform.lock.hcl

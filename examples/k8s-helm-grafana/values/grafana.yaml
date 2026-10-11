@@ -1,0 +1,17 @@
+# Values cho chart Grafana (grafana-community/grafana 13.5.0).
+# File này được review trong PR như code; KHÔNG chứa secret.
+
+replicas: 1
+
+service:
+  type: ClusterIP # truy cập bằng: kubectl -n monitoring port-forward svc/grafana 3000:80
+
+persistence:
+  enabled: false # demo: không cần volume
+
+# Mật khẩu admin lấy từ Secret tạo sẵn ngoài Terraform
+# (thực tế: External Secrets / Vault). Xem README phần ví dụ Helm.
+admin:
+  existingSecret: grafana-admin
+  userKey: admin-user
+  passwordKey: admin-password

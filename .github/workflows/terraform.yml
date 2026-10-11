@@ -1,0 +1,208 @@
+# =============================================================================
+# CI/CD Terraform - CHỈ ĐỂ MINH HỌA luồng review/approval (slide 15).
+#
+#   Pull Request   -> fmt -check, validate, plan -> đăng kết quả plan lên PR
+#   Merge vào main -> plan -out=tfplan (artifact) -> chờ duyệt (Environment prod)
+#                     -> apply tfplan -> thông báo kết quả
+#   Hằng ngày      -> plan -detailed-exitcode; exit 2 = drift -> mở issue cảnh báo
+#
+# Workflow này sẽ KHÔNG chạy đúng nghĩa với repo demo vì:
+#   - backend local: state nằm trên runner và mất sau mỗi job
+#     -> thực tế phải dùng remote backend (xem examples/remote-state-s3).
+#   - runner GitHub không có Docker Desktop của máy bạn.
+# Cấu hình bắt buộc trên GitHub:
+#   - Settings > Environments: tạo "dev" và "prod"; "prod" bật Required reviewers
+#   - Settings > Secrets: API_TOKEN, (tùy chọn) NOTIFY_WEBHOOK_URL
+# =============================================================================
+name: terraform
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 1 * * *" # 08:00 giờ Việt Nam
+  workflow_dispatch: {} # cho phép chạy drift check bằng tay
+
+# Không cho 2 lần chạy cùng lúc trên cùng một nhánh (tránh 2 apply song song).
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  # Runner Linux dùng unix socket thay cho named pipe của Windows.
+  TF_VAR_docker_host: unix:///var/run/docker.sock
+  # Secret lấy từ GitHub Secrets, không bao giờ nằm trong code.
+  TF_VAR_api_token: ${{ secrets.API_TOKEN }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: kiểm tra + plan cho từng môi trường (khi mở PR và khi merge)
+  # ---------------------------------------------------------------------------
+  plan:
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # để đăng comment plan lên PR
+    strategy:
+      fail-fast: false
+      matrix:
+        env: [dev, prod]
+    defaults:
+      run:
+        working-directory: envs/${{ matrix.env }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.5
+          terraform_wrapper: false
+
+      # Format sai -> fail ngay, buộc chạy "terraform fmt -recursive" trước khi push.
+      - name: terraform fmt -check
+        run: terraform fmt -check -recursive ../..
+
+      - name: terraform init
+        run: terraform init
+
+      - name: terraform validate
+        run: terraform validate
+
+      # Lưu plan ra file để bước apply dùng đúng những gì đã được review.
+      - name: terraform plan
+        run: |
+          terraform plan -out=tfplan
+          terraform show -no-color tfplan > plan.txt
+
+      # Đăng kết quả plan lên PR cho reviewer đọc ngay trong tab Conversation.
+      - name: Comment plan lên PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          PLAN_FILE: envs/${{ matrix.env }}/plan.txt
+          ENV_NAME: ${{ matrix.env }}
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync(process.env.PLAN_FILE, 'utf8').slice(0, 60000);
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `### Terraform plan: \`${process.env.ENV_NAME}\`\n\`\`\`\n${plan}\n\`\`\``,
+            });
+
+      # Chỉ khi merge vào main mới cần lưu plan cho job apply.
+      # File plan có thể chứa giá trị nhạy cảm -> artifact chỉ giữ 1 ngày.
+      - name: Upload plan
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.env }}
+          path: envs/${{ matrix.env }}/tfplan
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Job 2: apply file plan - chỉ khi merge vào main
+  # ---------------------------------------------------------------------------
+  apply:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1 # dev chạy xong mới tới prod
+      matrix:
+        env: [dev, prod]
+    # GitHub Environment: "prod" cấu hình Required reviewers
+    # -> job dừng ở trạng thái "Waiting" cho tới khi được Approve.
+    environment: ${{ matrix.env }}
+    defaults:
+      run:
+        working-directory: envs/${{ matrix.env }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.5
+
+      - name: terraform init
+        run: terraform init
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ matrix.env }}
+          path: envs/${{ matrix.env }}
+
+      # Apply file plan: không hỏi lại, không tính lại. Nếu state đã thay đổi
+      # kể từ lúc plan, Terraform từ chối ("Saved plan is stale").
+      - name: terraform apply
+        run: terraform apply tfplan
+
+      # Thông báo kết quả (thành công hay thất bại) qua webhook chat, nếu có cấu hình.
+      - name: Thông báo kết quả
+        if: always()
+        env:
+          WEBHOOK: ${{ secrets.NOTIFY_WEBHOOK_URL }}
+          MSG: "Terraform apply ${{ matrix.env }}: ${{ job.status }} - ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          echo "$MSG" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$WEBHOOK" ]; then
+            curl -sS -X POST -H 'Content-Type: application/json' \
+              -d "{\"text\": \"$MSG\"}" "$WEBHOOK"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Job 3: drift detection hằng ngày (lịch cron hoặc chạy tay)
+  # ---------------------------------------------------------------------------
+  drift:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write # để mở issue khi phát hiện drift
+    strategy:
+      fail-fast: false
+      matrix:
+        env: [dev, prod]
+    defaults:
+      run:
+        working-directory: envs/${{ matrix.env }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.5
+          terraform_wrapper: false
+
+      - name: terraform init
+        run: terraform init
+
+      # -detailed-exitcode: 0 = khớp, 1 = lỗi, 2 = có khác biệt (drift).
+      - name: terraform plan -detailed-exitcode
+        id: plan
+        run: |
+          set +e
+          terraform plan -detailed-exitcode -no-color > plan.txt
+          code=$?
+          echo "exitcode=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" -eq 1 ]; then exit 1; fi
+
+      # Có drift -> mở issue để team đưa thay đổi sửa tay ngược vào code.
+      - name: Cảnh báo drift
+        if: steps.plan.outputs.exitcode == '2'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create \
+            --title "Drift phát hiện ở môi trường ${{ matrix.env }} ($(date +%F))" \
+            --body "Plan khác với hạ tầng thật. Xem log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
